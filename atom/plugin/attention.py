@@ -221,6 +221,8 @@ def create_attn_metadata_builder_init_method(base_class):
         self.parallel_config = config.parallel_config
         self.cache_config = config.cache_config
 
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+
         self.num_heads_kv = self.model_config.get_num_kv_heads(self.parallel_config)
         self.head_dim = self.model_config.get_head_size()
         self.block_size = kv_cache_spec.block_size
@@ -300,8 +302,8 @@ def setup_attn_metadata_builder_base_class_and_attributes(class_dict: dict):
     needs_generic = True
 
     # align with vllm rocm aiter fa
-    class_dict["_cudagraph_support"] = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
-    class_dict["reorder_batch_threshold"] = 1
+    class_dict["_cudagraph_support"] = AttentionCGSupport.UNIFORM_BATCH
+    class_dict["reorder_batch_threshold"] = 1 # Remove this line?
 
     return base_class, generic_base, needs_generic, class_dict
 
@@ -326,7 +328,8 @@ class vllmAttentionMetadataBuilderMethods:
 
         # here assume the decode num token is 1 per request
         split_ret = split_decodes_prefills_and_extends(
-            common_attn_metadata=common_attn_metadata, decode_threshold=1
+            common_attn_metadata=common_attn_metadata,
+            decode_threshold=self.reorder_batch_threshold,
         )
 
         (
