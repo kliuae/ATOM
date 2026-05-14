@@ -433,7 +433,7 @@ class MLASparseAttentionImplPluginModeMethods:
                 self.num_heads,
                 self.kv_lora_rank + self.qk_rope_head_dim,
             ),
-            dtype=ql_nope.dtype,
+            dtype=dtypes.fp8 if fp8_attention else ql_nope.dtype,
             device=ql_nope.device,
         )
         if kv_cache.numel() > 0:
@@ -455,6 +455,15 @@ class MLASparseAttentionImplPluginModeMethods:
                 is_neox=self.rotary_emb.is_neox_style,
                 is_nope_first=True,
             )
+        elif fp8_attention:
+            from vllm import _custom_ops as ops
+
+            # Reshape to 2D for scaled_fp8_quant, then restore
+            q_flat, _ = ops.scaled_fp8_quant(
+                q_out.reshape(q_out.shape[0], -1),
+                layer._q_scale,
+            )
+            q_out = q_flat.reshape(q_out.shape)
 
         if self.head_repeat_factor > 1:
             q_out = q_out.repeat_interleave(self.head_repeat_factor, dim=1)
@@ -474,15 +483,6 @@ class MLASparseAttentionImplPluginModeMethods:
             BLOCK_SIZE=sparse_meta.block_size,
             NUM_TOPK_TOKENS=sparse_meta.topk_tokens,
         )
-        if fp8_attention:
-            from vllm import _custom_ops as ops
-
-            # Reshape to 2D for scaled_fp8_quant, then restore
-            q_flat, _ = ops.scaled_fp8_quant(
-                q_out.reshape(q_out.shape[0], -1),
-                layer._q_scale,
-            )
-            q_out = q_flat.reshape(q_out.shape)
         attn_out = self._forward_sparse_mla(
             q_out, kv_cache, attn_metadata, layer
         )
