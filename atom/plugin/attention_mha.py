@@ -333,11 +333,7 @@ class PagedAttentionImplPluginModeMethods:
     ):
         # For spec-decode verification (max_qlen > 1) pass qo_indptr so the
         # asm kernel knows the uniform per-request query boundaries.
-        qo_indptr = (
-            attn_metadata.plugin_metadata.decode_metadata.query_start_loc
-            if max_qlen > 1
-            else None
-        ) # TODO: can we always pass query_start_loc?
+        qo_indptr = attn_metadata.plugin_metadata.decode_metadata.query_start_loc
         aiter.pa_fwd_asm(
             Q=q,
             K=k_cache,

@@ -303,7 +303,7 @@ def setup_attn_metadata_builder_base_class_and_attributes(class_dict: dict):
 
     # align with vllm rocm aiter fa
     class_dict["_cudagraph_support"] = AttentionCGSupport.UNIFORM_BATCH
-    class_dict["reorder_batch_threshold"] = 1 # Remove this line?
+    class_dict["reorder_batch_threshold"] = 1
 
     return base_class, generic_base, needs_generic, class_dict
 
