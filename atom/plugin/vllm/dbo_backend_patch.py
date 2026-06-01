@@ -93,10 +93,7 @@ def patch_atom_dbo_bridge() -> None:
         cid = vub._THREAD_ID_TO_CONTEXT[threading.get_ident()]
         return vub._CURRENT_CONTEXTS[cid]
 
-    # --- patch helpers ------------------------------------------------------
-    # Each patched tbo_* function tests _in_vllm() first; if so, dispatch to
-    # the matching dbo_*; otherwise call the captured original (server-mode
-    # behaviour, completely unchanged).
+    # ============= Patch helpers
 
     _orig_tbo_active = ub.tbo_active
 
@@ -210,5 +207,5 @@ def patch_atom_dbo_bridge() -> None:
 
     setattr(ub, _ATOM_BRIDGE_PATCH_FLAG, True)
     logger.info(
-        "ATOM plugin: installed tbo_*->dbo_* bridge on atom.utils.tbo.ubatching"
+        "ATOM plugin: patched tbo_* -> dbo_* bridge on atom.utils.tbo.ubatching"
     )
