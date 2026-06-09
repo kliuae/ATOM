@@ -10,7 +10,10 @@ from aiter.dist.parallel_state import get_dp_group, get_tp_group
 from aiter.jit.utils.chip_info import get_gfx
 from atom.config import get_current_atom_config
 from atom.model_ops.attention_mla import _MLA_MIN_HEADS
-from atom.plugin.vllm.attention.layer_mla import disabled_mla_persistent_metadata
+from atom.plugin.vllm.attention.layer_mla import (
+    disabled_mla_persistent_metadata,
+    mla_fold_kv_metadata_triton,
+)
 from atom.utils import CpuGpuBuffer
 from atom.utils.block_convert import kv_indices_generate_triton
 from vllm.model_executor.layers.attention.mla_attention import (
@@ -901,6 +904,33 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             self.padded_num_attention_heads // 8 if self._mla_fold_enabled else 1
         )
 
+        # Persistent fold buffers for the nhead-fold workaround. Allocated once
+        # here (outside any cudagraph capture region) and refilled at build time
+        # in `_build_decode`. Previously these were allocated lazily inside the
+        # attention forward, i.e. inside the cudagraph capture region; under DBO
+        # vLLM's UBatchWrapper retains the per-step attn_metadata for every
+        # captured decode size, which pinned a fresh copy of these buffers per
+        # captured size per ubatch and blew GPU memory up (forcing very low
+        # gpu_memory_utilization and corrupting decode). One persistent buffer
+        # per builder avoids both the retention and the in-capture allocation.
+        if self._mla_fold_enabled:
+            ff = self._mla_fold_factor
+            max_fold_bs = max_num_reqs * ff
+            self.fold_kv_indptr = torch.zeros(
+                max_fold_bs + 1, dtype=torch.int32, device=device
+            )
+            self.fold_kv_indices = torch.empty(
+                max_num_pages * ff, dtype=torch.int32, device=device
+            )
+            # qo_indptr and last_page_len are constant for qseqlen==1 decode, so
+            # fill them once and never touch them again.
+            self.fold_qo_indptr = torch.arange(
+                max_fold_bs + 1, dtype=torch.int32, device=device
+            )
+            self.fold_kv_last_page_len = torch.ones(
+                max_fold_bs, dtype=torch.int32, device=device
+            )
+
     # TODO: support mtp and sparse
     def _set_mla_persistent_worker_buffers(
         self, bs: int, cu_seqlens_q: torch.Tensor, max_q_len: int = 1
@@ -1026,6 +1056,41 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             else None
         )
 
+        fold_kv_indptr = fold_kv_indices = None
+        fold_qo_indptr = fold_kv_last_page_len = None
+        if fold_factor is not None and fold_factor > 1:
+            new_bs = num_reqs * fold_factor
+            # Bound the indices view by this step's worst case
+            # (num_reqs * max_seq_len * fold_factor) so downstream
+            # get_meta_param() sees the same avg_kv (== max_seq_len) it would
+            # have for an exactly-sized buffer. At capture max_seq_len ==
+            # max_model_len, which is also the replay upper bound, so the
+            # captured decode kernel stays valid at replay.
+            fold_kv_indices_len = num_reqs * max_seq_len * fold_factor
+            assert fold_kv_indices_len <= self.fold_kv_indices.numel(), (
+                f"fold_kv_indices overflow: need {fold_kv_indices_len}, "
+                f"have {self.fold_kv_indices.numel()}"
+            )
+            fold_kv_indptr = self.fold_kv_indptr[: new_bs + 1]
+            fold_kv_indices = self.fold_kv_indices[:fold_kv_indices_len]
+            fold_qo_indptr = self.fold_qo_indptr[: new_bs + 1]
+            fold_kv_last_page_len = self.fold_kv_last_page_len[:new_bs]
+
+            # Replicate each request's kv-index segment fold_factor times into
+            # the persistent buffers. Done here at build time (outside the
+            # cudagraph capture region); the kernel reads the persistent
+            # paged_kv_indptr/indices that build() refreshes each step, exactly
+            # like kv_indices_generate_triton above, so the captured decode
+            # kernel that consumes these buffers replays correctly.
+            mla_fold_kv_metadata_triton(
+                paged_kv_indptr,
+                paged_kv_indices,
+                fold_kv_indptr,
+                fold_kv_indices,
+                fold_factor=fold_factor,
+                num_reqs=num_reqs,
+            )
+
         attn_metadata = AiterMlaDecodeMetadataForVllm(
             block_table=block_table_tensor,
             seq_lens=seq_lens_device,
@@ -1037,6 +1102,10 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             max_qo_len=max_qo_len,
             attn_out_dtype=self.decode_attn_out_dtype,
             fold_factor=fold_factor,
+            fold_kv_indptr=fold_kv_indptr,
+            fold_kv_indices=fold_kv_indices,
+            fold_qo_indptr=fold_qo_indptr,
+            fold_kv_last_page_len=fold_kv_last_page_len,
         )
 
         return attn_metadata
