@@ -119,3 +119,40 @@ def apply_vllm_req_id_passthrough_patch() -> bool:
             patched_draft,
         )
     return patched_target or patched_draft
+
+
+def apply_vllm_fwd_dump_patch() -> bool:
+    """DEBUG ONLY, env-gated. Install ATOM forward-dump hooks on the loaded model
+    in vLLM plugin mode.
+
+    ATOM's native ``model_engine/model_runner.py`` installs these hooks, but vLLM
+    plugin mode bypasses it, so wrap ``GPUModelRunner.load_model`` to install them
+    after the model loads. Completely no-op unless ``ATOM_FWD_DUMP_DIR`` is set.
+    """
+    import os
+
+    if not os.getenv("ATOM_FWD_DUMP_DIR"):
+        return False
+    try:
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+    except Exception:
+        return False
+    original = GPUModelRunner.load_model
+    if getattr(original, "_atom_fwd_dump_patched", False):
+        return True
+
+    @functools.wraps(original)
+    def wrapped(self, *args, **kwargs):
+        out = original(self, *args, **kwargs)
+        try:
+            from atom.utils.debug_helper import install_block_forward_hooks
+
+            n = install_block_forward_hooks(self.model)
+            logger.info("[ATOM_FWD_DUMP] installed %d forward hooks (plugin mode)", n)
+        except Exception as e:  # pragma: no cover - debug path
+            logger.warning("[ATOM_FWD_DUMP] hook install failed: %s", e)
+        return out
+
+    setattr(wrapped, "_atom_fwd_dump_patched", True)
+    GPUModelRunner.load_model = wrapped
+    return True

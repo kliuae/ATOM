@@ -5,6 +5,21 @@ from vllm.v1.attention.backends.mla.prefill.base import MLAPrefillBackend
 from atom.model_ops.minimax_m3.sparse_attn import SPARSE_BLOCK_SIZE
 
 
+def _indexes_kv_by_block_stride(cls) -> bool:
+    """Compute vLLM's ``indexes_kv_by_block_stride`` for an ATOM backend.
+
+    ATOM's vLLM-facing backends are duck-typed and do not inherit vLLM's
+    ``AttentionBackend``, but v0.25's ``GPUModelRunner.get_kv_cache_spec`` calls
+    ``layer.get_attn_backend().indexes_kv_by_block_stride()`` on whatever the
+    layer returns. Reuse vLLM's own classmethod logic so the value stays
+    consistent with each backend's declared ``get_kv_cache_stride_order`` (and
+    remains correct for subclasses that override the stride order).
+    """
+    from vllm.v1.attention.backend import AttentionBackend
+
+    return AttentionBackend.indexes_kv_by_block_stride.__func__(cls)
+
+
 class AiterMhaBackendForVllm:
     """vLLM-facing MHA backend surface for ATOM attention layers."""
 
@@ -70,6 +85,10 @@ class AiterMhaBackendForVllm:
     def is_ssm(cls) -> bool:
         return False
 
+    @classmethod
+    def indexes_kv_by_block_stride(cls) -> bool:
+        return _indexes_kv_by_block_stride(cls)
+
     @staticmethod
     def get_required_kv_cache_layout():
         return None
@@ -118,6 +137,29 @@ class AiterMlaBackendForVllm:
     def get_preferred_block_size(cls, default_block_size: int) -> int:
         return 1
 
+    @classmethod
+    def get_kv_cache_block_dim(
+        cls,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> int:
+        # v0.25's _reshape_kv_cache_tensors / _has_mixed_attention_kv_layout call
+        # this unguarded on the (duck-typed) backend. Mirror MHA/MiniMax: derive
+        # the block dim from this class's own get_kv_cache_shape, so the MLA
+        # subclasses (sparse MLA, sparse-MLA indexer, sparse-MHA indexer) that
+        # override the shape stay correct.
+        sentinel = 1234567
+        shape = cls.get_kv_cache_shape(
+            sentinel,
+            block_size,
+            num_kv_heads,
+            head_size,
+            cache_dtype_str=cache_dtype_str,
+        )
+        return shape.index(sentinel)
+
     @staticmethod
     def get_kv_cache_shape(
         num_blocks: int,
@@ -135,6 +177,10 @@ class AiterMlaBackendForVllm:
     @classmethod
     def is_ssm(cls) -> bool:
         return False
+
+    @classmethod
+    def indexes_kv_by_block_stride(cls) -> bool:
+        return _indexes_kv_by_block_stride(cls)
 
     @staticmethod
     def get_required_kv_cache_layout():
@@ -200,7 +246,27 @@ class AtomAiterMLAPrefillBackend(MLAPrefillBackend):
         )
         self._layer = layer
 
-    def run_prefill_new_tokens(self, q, k, v, return_softmax_lse):
+    def clone(self) -> "AtomAiterMLAPrefillBackend":
+        # vLLM's MLAPrefillBackend.clone() reconstructs via
+        # self.__class__(num_heads=..., ...) which omits ATOM's required leading
+        # ``layer`` arg; forward it so any inherited clone path stays valid.
+        return AtomAiterMLAPrefillBackend(
+            layer=self._layer,
+            num_heads=self.num_heads,
+            scale=self.scale,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            v_head_dim=self.v_head_dim,
+            vllm_config=self.vllm_config,
+        )
+
+    def run_prefill_new_tokens(
+        self, q, k, v, return_softmax_lse, out=None, output_scale=None
+    ):
+        # ``out``/``output_scale`` are accepted for v0.25's abstract-method
+        # signature; ATOM's native MLA prefill writes its own output buffer, so
+        # they are unused here.
         return self._layer._run_prefill_new_tokens(
             self._prefill_metadata,
             q,
@@ -329,15 +395,20 @@ class MiniMaxM3SparseAttentionBackend:
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> int:
-        sentinel = 1234567
-        shape = cls.get_kv_cache_shape(
-            sentinel,
-            block_size,
-            num_kv_heads,
-            head_size,
-            cache_dtype_str=cache_dtype_str,
-        )
-        return shape.index(sentinel)
+        # Report 0 to OPT OUT of v0.25's hybrid-model layout conversion.
+        # MiniMax-M3 is a hybrid (linear + sparse attention) model, so v0.25's
+        # GPUModelRunner._update_hybrid_attention_mamba_layout permutes every
+        # block_dim==1 attention KV cache from (2, num_blocks, ...) to
+        # (num_blocks, 2, ...) (k/v interleaved per block) to match the mamba
+        # block layout. That interleaving strides the per-block k data apart and
+        # breaks _page16_shuffle_cache_for_sparse_kernel's asm `.view()` (the
+        # aiter fused_qknorm_idxrqknorm kernel + ATOM's slot_mapping both expect
+        # the non-interleaved (2, num_blocks, ...) layout). The conversion skips
+        # any layer whose block_dim==0, so returning 0 keeps the cache in the
+        # contiguous (2, num_blocks, ...) layout ATOM's sparse asm path requires.
+        # (Our own sparse metadata/kernel manage the physical layout, so vLLM's
+        # generic block_dim is not otherwise used for this cache.)
+        return 0
 
     @classmethod
     def get_preferred_block_size(cls, default_block_size: int) -> int:
@@ -366,6 +437,10 @@ class MiniMaxM3SparseAttentionBackend:
     @classmethod
     def is_ssm(cls) -> bool:
         return False
+
+    @classmethod
+    def indexes_kv_by_block_stride(cls) -> bool:
+        return _indexes_kv_by_block_stride(cls)
 
     @staticmethod
     def get_required_kv_cache_layout():
@@ -458,6 +533,10 @@ class GDNAttentionBackend:
     @staticmethod
     def get_name() -> str:
         return "ROCM_GDN_ATTENTION"
+
+    @classmethod
+    def indexes_kv_by_block_stride(cls) -> bool:
+        return _indexes_kv_by_block_stride(cls)
 
     @staticmethod
     def get_impl_cls() -> Type:

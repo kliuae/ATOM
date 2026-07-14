@@ -231,9 +231,42 @@ def _patch_vllm_deepseek_v4_mtp_first_pass_inputs() -> None:
     SpecDecodeBaseProposer.set_inputs_first_pass = wrapped_set_inputs_first_pass
 
 
+def _patch_vllm_mtp_returns_single_tensor() -> None:
+    """Force ``model_returns_tuple`` False for ATOM-wrapped draft models.
+
+    Every ATOM draft model (all wrapped by ``ATOMModelBase``) returns a single
+    hidden-states tensor from ``forward`` — the pre-0.25 contract. v0.25's
+    ``SpecDecodeBaseProposer.model_returns_tuple`` started returning True for
+    DeepSeek-family MTP (draft arch contains ``DeepSeekMTPModel``), which now
+    also covers the GLM-5 / DeepSeek MTP drafts ATOM serves through that
+    single-tensor wrapper. vLLM then does ``last, hidden = ret_hidden_states``,
+    unpacking a ``[num_tokens, hidden]`` tensor along dim 0 and raising
+    ``ValueError: too many values to unpack (expected 2)`` on the first decode.
+    Returning False routes ATOM drafts back through the single-tensor branch
+    (``last_hidden_states = hidden_states = ret_hidden_states``).
+    """
+    from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
+
+    original = SpecDecodeBaseProposer.model_returns_tuple
+    if getattr(original, "_atom_returns_tuple_patched", False):
+        return
+
+    @functools.wraps(original)
+    def wrapped_model_returns_tuple(self) -> bool:
+        from atom.plugin.vllm.model_wrapper import ATOMModelBase
+
+        if isinstance(getattr(self, "model", None), ATOMModelBase):
+            return False
+        return original(self)
+
+    setattr(wrapped_model_returns_tuple, "_atom_returns_tuple_patched", True)
+    SpecDecodeBaseProposer.model_returns_tuple = wrapped_model_returns_tuple
+
+
 def apply_vllm_spec_decode_patch() -> None:
     """Patch vLLM speculative decoding for ATOM metadata compatibility."""
     _patch_vllm_llm_base_model_sharing()
+    _patch_vllm_mtp_returns_single_tensor()
     _patch_vllm_draft_kv_group_validation()
     _patch_vllm_draft_positions_on_metadata()
     _patch_vllm_deepseek_v4_mtp_first_pass_inputs()

@@ -1623,10 +1623,15 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
             torch.float8_e4m3fnuz,
             torch.float8_e4m3fn,
         ]:
-            from aiter.ops.shuffle import shuffle_weight
-
-            w13.data = shuffle_weight(w13.data)
-            w2.data = shuffle_weight(w2.data)
+            # Use the shared shuffle_weights() helper (same path as the working
+            # per_Token Fp8MoEMethod). It applies the asm layout the tuned aiter
+            # fused_moe kernel expects AND marks the params is_shuffled=True. The
+            # previous raw shuffle_weight() calls left is_shuffled unset, so aiter
+            # dispatched the NON-preshuffle kernel on preshuffled weights
+            # ("[fused_moe] ... is_shuffled=False ... may produce incorrect
+            # results") -> GPU worker fault under large prefill batches (GLM-4.7
+            # compressed-tensors died on the first gsm8k batch, M=2048).
+            shuffle_weights(w13, w2)
 
         # Call parent class for any additional processing
         super().process_weights_after_loading(layer)

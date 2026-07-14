@@ -244,7 +244,9 @@ def register_model() -> None:
     # proxy can key state-slot allocation on the request id (host-resident)
     # instead of a D2H copy of the first block id.
     from atom.plugin.vllm.req_id_passthrough_patch import (
+        apply_vllm_fwd_dump_patch,
         apply_vllm_req_id_passthrough_patch,
     )
 
     apply_vllm_req_id_passthrough_patch()
+    apply_vllm_fwd_dump_patch()  # DEBUG: no-op unless ATOM_FWD_DUMP_DIR is set
