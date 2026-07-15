@@ -908,7 +908,18 @@ class AttentionForVllmMHA(nn.Module, AttentionLayerBase):
 
         assert self.attn_type == AttentionType.DECODER
         block_size = vllm_config.cache_config.block_size
-        if self.sliding_window is not None:
+        # NOTE: ATOM sets ``self.sliding_window`` to -1 (NOT None) for full
+        # attention layers (see __init__), so ``is not None`` is always true and
+        # would classify EVERY layer as sliding window. Upstream vLLM's identical
+        # ``if self.sliding_window is not None`` works only because upstream uses
+        # None for full layers. For a model with mixed layer types (e.g. gpt-oss:
+        # alternating sliding_attention / full_attention), the full layers would
+        # get SlidingWindowSpec(sliding_window=-1); vLLM's SlidingWindowManager
+        # then computes get_num_skipped_tokens = num_computed - (-1) + 1 =
+        # num_computed + 2 > 0 and frees ~every KV block for those layers once a
+        # sequence grows past one block, destroying the full-attention KV history
+        # -> garbage / zero accuracy. Route -1 (and None) to FullAttentionSpec.
+        if self.sliding_window is not None and self.sliding_window > 0:
             return SlidingWindowSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
