@@ -1711,10 +1711,11 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
             torch.float8_e4m3fnuz,
             torch.float8_e4m3fn,
         ]:
-            from aiter.ops.shuffle import shuffle_weight
-
-            w13.data = shuffle_weight(w13.data)
-            w2.data = shuffle_weight(w2.data)
+            # Use the shared shuffle_weights() to apply the asm layout the tuned aiter
+            # fused_moe kernel expects and mark the params is_shuffled=True.
+            # The raw shuffle_weight() calls left is_shuffled unset and may produce
+            # incorrect results
+            shuffle_weights(w13, w2)
 
         # Call parent class for any additional processing
         super().process_weights_after_loading(layer)

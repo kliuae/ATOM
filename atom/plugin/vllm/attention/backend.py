@@ -388,15 +388,21 @@ class MiniMaxM3SparseAttentionBackend:
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> int:
-        sentinel = 1234567
-        shape = cls.get_kv_cache_shape(
-            sentinel,
-            block_size,
-            num_kv_heads,
-            head_size,
-            cache_dtype_str=cache_dtype_str,
-        )
-        return shape.index(sentinel)
+        # Report 0 to OPT OUT of v0.25's hybrid-model layout conversion.
+        # MiniMax-M3 is a hybrid (linear + sparse attention) model, so v0.25's
+        # GPUModelRunner._update_hybrid_attention_mamba_layout permutes every
+        # block_dim==1 attention KV cache from (2, num_blocks, ...) to
+        # (num_blocks, 2, ...) (k/v interleaved per block) to match the mamba
+        # block layout. That interleaving strides the per-block k data apart and
+        # breaks _page16_shuffle_cache_for_sparse_kernel's asm `.view()` (the
+        # aiter fused_qknorm_idxrqknorm kernel + ATOM's slot_mapping both expect
+        # the non-interleaved (2, num_blocks, ...) layout) -> "view size is not
+        # compatible with input tensor's size and stride" at KV-cache init. The
+        # conversion skips any layer whose block_dim==0, so returning 0 keeps the
+        # cache in the contiguous (2, num_blocks, ...) layout ATOM's sparse asm
+        # path requires. (Our own sparse metadata/kernel manage the physical
+        # layout, so vLLM's generic block_dim is not otherwise used here.)
+        return 0
 
     @classmethod
     def get_preferred_block_size(cls, default_block_size: int) -> int:
